@@ -2,19 +2,26 @@
 Base implementation of the Page Object pattern.
 See https://code.google.com/p/selenium/wiki/PageObjects
 """
-
-import logging
-import socket
-import urlparse
 from abc import ABCMeta, abstractmethod, abstractproperty
-from collections import defaultdict
+from collections import defaultdict, namedtuple
 from functools import wraps
 from contextlib import contextmanager
+import json
+import logging
+import os
+import socket
 from textwrap import dedent
+import urlparse
+
+import requests
 from selenium.common.exceptions import WebDriverException
 
 from .query import BrowserQuery
 from .promise import Promise, EmptyPromise, BrokenPromise
+
+
+AXS_FILE = 'vendor/axs_testing.js'
+AuditResults = namedtuple('AuditResults', 'errors, warnings')
 
 
 class WrongPageError(Exception):
@@ -27,6 +34,13 @@ class WrongPageError(Exception):
 class PageLoadError(Exception):
     """
     An error occurred while loading the page.
+    """
+    pass
+
+
+class AccessibilityError(Exception):
+    """
+    The page violates one or more accessibility rules.
     """
     pass
 
@@ -173,6 +187,7 @@ class PageObject(object):
             PageObject
         """
         self.browser = browser
+        self.verify_accessibility = bool(os.environ.get('VERIFY_ACCESSIBILITY'))
 
     @abstractmethod
     def is_browser_on_page(self):
@@ -262,7 +277,7 @@ class PageObject(object):
         # does not return True before timing out.
         try:
             return self.wait_for_page()
-        except (BrokenPromise):
+        except BrokenPromise:
             raise PageLoadError("Timed out waiting to load page '{!r}' at URL '{}'".format(
                 self, self.url
             ))
@@ -321,10 +336,15 @@ class PageObject(object):
         Raises:
             BrokenPromise: The timeout is exceeded without the page loading successfully.
         """
-        return Promise(
+        result = Promise(
             lambda: (self.is_browser_on_page(), self), "loaded page {!r}".format(self),
             timeout=timeout
         ).fulfill()
+
+        if self.verify_accessibility:
+            self._check_for_accessibility_errors()
+
+        return result
 
     @unguarded
     def q(self, **kwargs):
@@ -500,3 +520,125 @@ class PageObject(object):
 
         """
         self.wait_for(lambda: not self.q(css=element_selector).visible, description=description, timeout=timeout)
+
+    def axs_audit_rules(self):
+        """
+        List of rules to check for accessibility errors on the page.
+        See https://github.com/GoogleChrome/accessibility-developer-tools/tree/master/src/audits
+
+        E.g. return ['badAriaAttributeValue']
+        An empty list means to check for all available rules.
+        None means that no audit should be done for this page.
+        """
+        return None
+
+    def axs_scope(self):
+        """
+        Scope for limiting the check for accessibility errors on the page.
+        Defaults to the entire body of the page.
+        """
+        return 'document.querySelector("body")'
+
+    def do_axs_audit(self):
+        """
+        Use Google's Accessibility Developer Tools to audit the
+        page for accessibility problems.
+
+        See https://github.com/GoogleChrome/accessibility-developer-tools
+
+        Since this needs to inject JavaScript into the browser page, the only
+        known way to do this is to use PhantomJS as your browser.
+
+        Raises:
+            NotImplementedError if you are not using PhantomJS
+            RuntimeError if there was a problem getting the report
+
+        Returns:
+            A list (one for each browser session) of namedtuples with 'errors' and 'warnings'
+            fields whose values are the errors and warnings returned from the audit.
+
+            None if the page object has no rules defined to check.
+        """
+        if self.browser.name != 'phantomjs':
+            msg = 'Accessibility auditing is only supported with PhantomJS as the browser.'
+            raise NotImplementedError(msg)
+
+        rules = self.axs_audit_rules()
+        if rules is None:
+            return None
+
+        # The ghostdriver URL will be something like this: 'http://localhost:33225/wd/hub'
+        ghostdriver_url = self.browser.service.service_url
+
+        # Get the session_id from ghostdriver so that we can inject JS into the page.
+        resp = requests.get('{}/sessions'.format(ghostdriver_url))
+        sessions = resp.json()
+
+        # report is the list that is returned, with one item for each browser session
+        report = []
+
+        for session in sessions.get('value'):
+            session_id = session.get('id')
+
+            # This line will only be included in the script if rules to check on this page
+            # are specified, as the default behavior of the js is to run all rules.
+            if len(rules) > 0:
+                rules_config = "auditConfig.auditRulesToRun = {rules};".format(
+                    rules=rules)
+            else:
+                rules_config = ""
+
+            script = dedent("""
+                var page = this;
+                page.injectJs("{file}");
+                var report = page.evaluate(function() {{
+                  var auditConfig = new axs.AuditConfiguration();
+                  {rules_config}
+                  auditConfig.scope = {scope};
+                  var run_results = axs.Audit.run(auditConfig);
+                  var audit_results = axs.Audit.auditResults(run_results)
+                  return audit_results;
+                }});
+                return report;
+            """.format(file=AXS_FILE, rules_config=rules_config, scope=self.axs_scope()))
+
+            payload = {"script": script, "args": []}
+            resp = requests.post('{}/session/{}/phantom/execute'.format(
+                ghostdriver_url, session_id), data=json.dumps(payload))
+
+            result = resp.json().get('value')
+            if result is None:
+                msg = '{} {}'.format(
+                    'No results were returned by the audit report.',
+                    'Perhaps there was a problem with the rules or scope defined for this page.')
+                raise RuntimeError(msg)
+
+            # audit_results is report of accessibility errors for that session
+            audit_results = AuditResults(errors=result.get('errors_'), warnings=result.get('warnings_'))
+            report.append(audit_results)
+
+        return report
+
+    def _check_for_accessibility_errors(self):
+        """
+        Parse the results of an axs_audit and raise a single exception
+        if there are violations.
+
+        Returns:
+            None
+
+        Raises:
+            AccessibilityError
+        """
+        errors = []
+        audit = self.do_axs_audit()
+        for session_result in audit:
+            if session_result:
+                if len(session_result.errors) > 0:
+                    errors.extend(session_result.errors)
+
+        num_errors = len(errors)
+
+        if num_errors > 0:
+            msg = "URL '{}' has {} errors: {}".format(self.url, num_errors, ", ".join(errors))
+            raise AccessibilityError(msg)
